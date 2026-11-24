@@ -80,7 +80,7 @@ jobs:
 
   # Real Apple Silicon runner: NEON CPU path natively + Metal build.
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
