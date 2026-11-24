@@ -62,7 +62,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt ziglang
-      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
       - name: NEON compile check (apple_m1 + cortex_a72)
         run: python build.py --check-neon
       - name: cross build test_core (aarch64, dotprod)
@@ -76,7 +76,7 @@ jobs:
           from tinyinfer_ref.model import QwenRef
           QwenRef("build-arm/tiny-q8.gguf").forward([5, 77, 300, 12]).astype(np.float32).tofile("build-arm/expected.bin")
           EOF
-          qemu-aarch64-static ./build-arm/test_core build-arm/tiny-q8.gguf build-arm/expected.bin
+          qemu-aarch64 ./build-arm/test_core build-arm/tiny-q8.gguf build-arm/expected.bin
 
   # Real Apple Silicon runner: NEON CPU path natively + Metal build.
   macos-arm64:
