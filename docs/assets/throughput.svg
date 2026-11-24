@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330">
+<rect width="900" height="330" rx="10" fill="#0d1117" stroke="#30363d"/>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+<text x="28" y="38" font-size="18" font-weight="700" fill="#e6edf3">End-to-end CPU throughput (tok/s, higher is better)</text>
+<text x="28" y="62" font-size="13" fill="#8b949e">AMD Ryzen 5 3600 (Zen 2, AVX2, DDR4), Windows 10, 6 threads, mean of 3 runs</text>
+<text x="200" y="100" font-size="14" fill="#e6edf3">decode  tg64</text>
+<text x="28" y="136" font-size="13" fill="#e6edf3">Qwen2.5-0.5B</text>
+<text x="150" y="136" font-size="13" fill="#F97316">Q8_0</text>
+<rect x="200" y="120" width="117.6" height="22" rx="3" fill="#F97316"/>
+<text x="323.6" y="136" font-size="13" fill="#e6edf3">40.9</text>
+<text x="28" y="180" font-size="13" fill="#e6edf3">Qwen2.5-0.5B</text>
+<text x="150" y="180" font-size="13" fill="#FDBA74">Q4_0</text>
+<rect x="200" y="164" width="196.9" height="22" rx="3" fill="#FDBA74"/>
+<text x="402.9" y="180" font-size="13" fill="#e6edf3">68.5</text>
+<text x="28" y="224" font-size="13" fill="#e6edf3">Qwen2.5-1.5B</text>
+<text x="150" y="224" font-size="13" fill="#F97316">Q8_0</text>
+<rect x="200" y="208" width="38.8" height="22" rx="3" fill="#F97316"/>
+<text x="244.8" y="224" font-size="13" fill="#e6edf3">13.5</text>
+<text x="28" y="268" font-size="13" fill="#e6edf3">Qwen2.5-1.5B</text>
+<text x="150" y="268" font-size="13" fill="#FDBA74">Q4_0</text>
+<rect x="200" y="252" width="64.7" height="22" rx="3" fill="#FDBA74"/>
+<text x="270.7" y="268" font-size="13" fill="#e6edf3">22.5</text>
+<text x="510" y="100" font-size="14" fill="#e6edf3">prefill  pp128</text>
+<rect x="510" y="120" width="202.4" height="22" rx="3" fill="#F97316"/>
+<text x="718.4" y="136" font-size="13" fill="#e6edf3">154.0</text>
+<rect x="510" y="164" width="205.8" height="22" rx="3" fill="#FDBA74"/>
+<text x="721.8" y="180" font-size="13" fill="#e6edf3">156.6</text>
+<rect x="510" y="208" width="76.5" height="22" rx="3" fill="#F97316"/>
+<text x="592.5" y="224" font-size="13" fill="#e6edf3">58.2</text>
+<rect x="510" y="252" width="68.1" height="22" rx="3" fill="#FDBA74"/>
+<text x="584.1" y="268" font-size="13" fill="#e6edf3">51.8</text>
+<text x="28" y="308" font-size="12" fill="#8b949e">Random weights with the real Qwen2.5 shapes (speed does not depend on weight values). Not an M1, not a llama.cpp comparison.</text>
+</g></svg>

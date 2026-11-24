@@ -1,27 +1,64 @@
-# tinyinfer
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="tinyinfer: an LLM inference engine from scratch in C11" width="100%">
+</p>
 
-**An LLM inference engine written from scratch in C11: GGUF loader, byte-level
-BPE tokenizer, Qwen2 transformer, KV cache, Q8_0/Q4_0 quantisation, SIMD
-matmul kernels (NEON/SDOT for Apple Silicon, AVX2 for x86), a thread pool,
-sampling, and a Metal GPU backend.** No dependencies: not ggml, not BLAS, not a
-tokenizer library. The target is Qwen2.5-1.5B-Instruct on an M1 MacBook.
+<p align="center">
+  <a href="https://github.com/coopersimpson101-debug/tinyinfer/actions/workflows/ci.yml"><img src="https://github.com/coopersimpson101-debug/tinyinfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/language-C11-F97316.svg" alt="C11">
+  <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="no dependencies">
+  <img src="https://img.shields.io/badge/SIMD-NEON%20SDOT%20%C2%B7%20AVX2-informational.svg" alt="NEON SDOT and AVX2">
+  <img src="https://img.shields.io/badge/GPU-Metal-lightgrey.svg" alt="Metal backend">
+</p>
 
+**Run Qwen2.5 GGUF models with an engine you can read in an afternoon.** tinyinfer
+is a from-scratch C11 LLM runtime - GGUF loader, BPE tokenizer, Qwen2
+transformer, Q8_0/Q4_0 kernels, thread pool, sampler and a Metal backend - with
+no ggml, no BLAS and no tokenizer library, every piece checked against an
+independent NumPy oracle.
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#results">Results</a> ·
+  <a href="#roadmap">Roadmap</a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/terminal.svg" alt="Real tinyinfer run on the random-weight 2-layer test model" width="92%">
+</p>
+<p align="center"><sub>Real output on the 2-layer <b>random-weight</b> test model that the test-suite generates (hence the gibberish).
+Regenerate with <code>python docs/assets/make_figures.py</code>.</sub></p>
+
+## Highlights
+
+- **Zero dependencies:** ~3.8k lines of C11 + Metal plus libc/pthreads (Win32 threads on Windows); Python + NumPy only for tests.
+- **Quantised int8 matmuls:** Q8_0 / Q4_0 weights x Q8_0 activations, two `SDOT`s per 32-weight block on Apple Silicon, `maddubs` on AVX2, bit-exact with ggml's formats.
+- **Verified, not eyeballed:** 168 pytest cases + 112 C tests compare logits, tokens and bytes with a NumPy reference and the real Qwen2 regex.
+- **Runs on 4 CI targets:** Linux AVX2 / scalar / ASan+UBSan, Windows (zig cc), aarch64 NEON under qemu, and a GitHub macOS arm64 runner (NEON natively + Metal GPU).
+- **Metal backend:** matvec for f32/f16/q8_0/q4_0, RMSNorm, RoPE, online-softmax attention, SwiGLU; GPU logits match NumPy to < 1e-3 x std on the CI runner.
+- **Real-size speed on a desktop CPU:** 68.5 tok/s decode for Qwen2.5-0.5B-shaped Q4_0, 22.5 tok/s for 1.5B (Ryzen 5 3600, random weights).
+
+## Status
+
+| | what | where it was checked |
+|---|---|---|
+| ✅ | CPU engine, scalar + AVX2: full test-suite (168 passed, 112 C tests) | Windows 10 / Ryzen 5 3600 here; Linux CI (+ ASan/UBSan) |
+| ✅ | NEON + SDOT kernels and full test-suite, natively | GitHub macOS arm64 runner (CI `macos-arm64`) |
+| ✅ | Metal backend builds; 5 GPU-vs-NumPy logit tests pass | GitHub macOS arm64 runner (toy models only) |
+| 🧪 | NEON kernels on `cortex-a76` + forward pass vs NumPy | qemu-aarch64 in CI (emulated) |
+| ⏳ | Real Qwen2.5-1.5B weights vs Hugging Face logits | needs the 3 GB download + `scripts/validate_hf.py` |
+| ⏳ | Throughput on an M1 MacBook, CPU and Metal, vs llama.cpp | needs an M1: `scripts/bench.sh` |
+
+## Quickstart
+
+```bash
+git clone https://github.com/coopersimpson101-debug/tinyinfer && cd tinyinfer
+make                                   # or: pip install ziglang && python build.py   (Windows)
+python scripts/make_tiny_model.py -o build/tiny.gguf --type q4_0   # no download needed
+build/tinyinfer -m build/tiny.gguf -p "Hello" -n 32                # random weights -> gibberish
+scripts/download_qwen.sh && build/tinyinfer -m models/qwen2.5-1.5b-instruct-q8_0.gguf --chat -p "What is a KV cache?"
 ```
-$ build/tinyinfer -m models/qwen2.5-1.5b-instruct-q8_0.gguf --chat -p "What is a KV cache?" -n 128
-```
-
-Every numerical piece is checked against an independent NumPy implementation
-of the same model (`python/tinyinfer_ref/`) using tiny, randomly initialised
-Qwen2 models that a script in this repo writes to GGUF, so the whole test-suite
-runs in seconds with no downloads.
-
-> **Status (honest):** the CPU engine (scalar + AVX2) is implemented and
-> tested on Windows/x86-64; the NEON path compiles for `apple_m1` (checked
-> with zig) and CI is set up to execute it under qemu and on a macOS arm64
-> runner, but the workflow has not run yet (repo not pushed) and it has never
-> run on a real M1. The Metal backend is written but has **not been compiled or run**
-> (no Mac was available). No real-model numbers or llama.cpp comparisons exist
-> yet: see [Hardware validation](#hardware-validation--todo-for-the-author).
 
 ## Contents
 
@@ -221,10 +258,11 @@ What is tested (all against independent implementations, not against itself):
 Last local run (Windows 10, Ryzen 5 3600, zig cc 0.17.1 (`pip install ziglang`) via `build.py`):
 `168 passed, 5 skipped` (the 5 skipped are the Metal tests); `test_core`:
 `112 passed, 0 failed`; the same suite also passes with `--portable` (scalar
-kernels). CI (`.github/workflows/ci.yml`) is configured for Linux AVX2 + scalar +
+kernels). CI (`.github/workflows/ci.yml`) runs the same suites on Linux AVX2 + scalar +
 ASan/UBSan, Windows (zig), aarch64 under qemu (NEON/SDOT kernels and a full
-forward pass vs NumPy) and a macOS arm64 runner (NEON natively, Metal build);
-it has not been run yet, so expect a first-push fix or two.
+forward pass vs NumPy) and a GitHub macOS arm64 runner (NEON natively:
+`test_core` reports `simd path: neon-dotprod`, `112 passed`; pytest `168 passed`;
+then `make metal` and the 5 Metal tests: `5 passed`).
 
 ## Results
 
@@ -243,6 +281,8 @@ Windows 10, zig cc `-O2 -march=native`. Models: **random weights with the real
 Qwen2.5 shapes** (`make_tiny_model.py --preset ...`; speed does not depend on
 the weight values). `tinyinfer --bench PP,TG -t 6 -r 3` (mean of 3):
 
+<p align="center"><img src="docs/assets/throughput.svg" alt="Measured CPU throughput on a Ryzen 5 3600, random-weight models with real Qwen2.5 shapes" width="88%"></p>
+
 | shapes (random weights) | weights | file size | pp128 t/s | tg64 t/s |
 |---|---|---|---|---|
 | Qwen2.5-0.5B | Q8_0 | 529 MB | 154.0 | 40.9 |
@@ -253,7 +293,9 @@ the weight values). `tinyinfer --bench PP,TG -t 6 -r 3` (mean of 3):
 (tg is measured from an empty KV cache, like llama-bench. For Q8_0 1.5B,
 13.5 tok/s x 1.64 GB = ~22 GB/s of weight streaming on dual-channel DDR4.)
 
-Kernel micro-benchmark (`build/bench_kernels 6 50`, Qwen2.5-1.5B layer shapes):
+<details>
+<summary><b>Kernel micro-benchmark</b> (<code>build/bench_kernels 6 50</code>, Qwen2.5-1.5B layer shapes)</summary>
+
 
 | format | shape | decode ms | decode GB/s | prefill-64 GFLOP/s |
 |---|---|---|---|---|
@@ -274,24 +316,26 @@ table above is the realistic one. Q4_0 moves about half the bytes of Q8_0
 but spends extra instructions unpacking nibbles, so on cache-resident shapes
 its latency is similar and its GB/s lower.
 
+</details>
+
 These are only here to show the engine works at real sizes; they say nothing
 about the M1 or about llama.cpp.
 
-### tinyinfer vs llama.cpp on M1 (to be filled by `scripts/bench.sh`)
+### tinyinfer vs llama.cpp on M1 (⏳ pending an M1 run of `scripts/bench.sh`)
 
 Qwen2.5-1.5B-Instruct, same GGUF file for both engines, pp512 / tg128,
-M1 performance cores. **Empty cells = not measured yet.**
+M1 performance cores. Cells marked ⏳ have not been measured; nothing here is estimated.
 
 | model | backend | test | tinyinfer t/s | llama.cpp t/s | ratio |
 |---|---|---|---|---|---|
-| Q8_0 | CPU (NEON) | pp512 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q8_0 | CPU (NEON) | tg128 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q4_0 (pure) | CPU (NEON) | pp512 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q4_0 (pure) | CPU (NEON) | tg128 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q8_0 | Metal | pp512 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q8_0 | Metal | tg128 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q4_0 (pure) | Metal | pp512 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
-| Q4_0 (pure) | Metal | tg128 | run scripts/bench.sh on M1 | run scripts/bench.sh on M1 | |
+| Q8_0 | CPU (NEON) | pp512 | ⏳ | ⏳ | |
+| Q8_0 | CPU (NEON) | tg128 | ⏳ | ⏳ | |
+| Q4_0 (pure) | CPU (NEON) | pp512 | ⏳ | ⏳ | |
+| Q4_0 (pure) | CPU (NEON) | tg128 | ⏳ | ⏳ | |
+| Q8_0 | Metal | pp512 | ⏳ | ⏳ | |
+| Q8_0 | Metal | tg128 | ⏳ | ⏳ | |
+| Q4_0 (pure) | Metal | pp512 | ⏳ | ⏳ | |
+| Q4_0 (pure) | Metal | tg128 | ⏳ | ⏳ | |
 
 Expectation, so the numbers can be judged when they arrive: llama.cpp has
 years of kernel tuning (register-blocked GEMM for prefill, simdgroup-matrix
@@ -301,8 +345,9 @@ behind on prefill and on Metal.
 
 ## Hardware validation / TODO for the author
 
-Nothing in this section has been run yet. Commands are exact; paste the
-output into the tables.
+Items 1 and 2 now run on every push on a GitHub-hosted macOS arm64 runner
+(an Apple-Silicon VM, toy models only); they still need a run on a real M1.
+Items 3-5 have not been run. Commands are exact; paste the output into the tables.
 
 1. **Build and test on the M1** (first native run of the NEON + SDOT kernels):
 
@@ -313,10 +358,11 @@ output into the tables.
 
    | check | result |
    |---|---|
-   | `make test` on M1 | |
-   | `test_core` simd path | |
+   | `make test`, GitHub macOS arm64 runner | ✅ 112 C tests + 168 pytest passed |
+   | `test_core` simd path, GitHub macOS arm64 runner | ✅ `neon-dotprod` |
+   | `make test` on M1 | ⏳ |
 
-2. **Metal backend** (never compiled so far; expect to fix compile errors):
+2. **Metal backend**:
 
    ```bash
    make metal
@@ -325,9 +371,10 @@ output into the tables.
 
    | check | result |
    |---|---|
-   | `make metal` compiles | |
-   | shaders compile at start-up | |
-   | 5 Metal tests pass | |
+   | `make metal` compiles (GitHub macOS arm64 runner) | ✅ |
+   | shaders compile at start-up (runner) | ✅ |
+   | 5 Metal tests pass (runner, paravirtual GPU) | ✅ `5 passed` |
+   | 5 Metal tests pass on M1 | ⏳ |
 
 3. **Real model correctness** vs Hugging Face transformers (needs
    `pip install torch transformers`, downloads ~3 GB of HF weights):
@@ -364,7 +411,8 @@ output into the tables.
 
 ## Roadmap
 
-- [ ] Run everything in the hardware section on an M1; fix the Metal backend.
+- [x] NEON + Metal build and toy-model tests on Apple Silicon (GitHub macOS arm64 runner).
+- [ ] Run everything in the hardware section on a real M1 with real weights.
 - [ ] Prefill: register-blocked GEMM tiles (e.g. 4 rows × 4 tokens) instead of
       per-row dot products; Metal batched prefill with `simdgroup_matrix`.
 - [ ] f16 KV cache (halves cache bandwidth at long context); KV cache on GPU in f16.

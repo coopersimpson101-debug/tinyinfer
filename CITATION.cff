@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "tinyinfer: an LLM inference engine from scratch in C11"
+abstract: "A dependency-free C11 inference engine for Qwen2 GGUF models with Q8_0/Q4_0 quantisation, NEON/AVX2 kernels and a Metal backend, tested against a NumPy reference."
+authors:
+  - name: "the tinyinfer authors"
+license: MIT
+repository-code: "https://github.com/coopersimpson101-debug/tinyinfer"
+keywords:
+  - llm
+  - inference
+  - gguf
+  - quantization
+  - simd
+  - metal

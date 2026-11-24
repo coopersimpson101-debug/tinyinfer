@@ -1,0 +1,44 @@
+name: Bug report
+description: Something builds, runs or computes incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, starting from a clean checkout.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Full output / logs
+      render: text
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - GGUF loader
+        - tokenizer
+        - forward pass / numerics
+        - CPU kernels (NEON/AVX2/scalar)
+        - Metal backend
+        - sampler
+        - CLI / build
+        - docs
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "OS, CPU (and `simd path` printed by `build/test_core`), compiler, model file + quant type"
+    validations:
+      required: true

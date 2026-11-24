@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="922" height="328" viewBox="0 0 922 328">
+<rect width="922" height="328" rx="10" fill="#0d1117" stroke="#30363d"/>
+<path d="M0 10a10 10 0 0 1 10-10h902a10 10 0 0 1 10 10v20H0z" fill="#161b22"/>
+<circle cx="20" cy="15" r="6" fill="#ff5f57"/><circle cx="40" cy="15" r="6" fill="#febc2e"/><circle cx="60" cy="15" r="6" fill="#28c840"/>
+<text x="461.0" y="20" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#8b949e">tinyinfer - random-weight 2-layer Qwen2 test model</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" xml:space="preserve">
+<text x="22" y="58" fill="#e6edf3"><tspan fill="#F97316">$</tspan> python scripts/make_tiny_model.py -o build/tiny.gguf --type q4_0 --seed 0</text>
+<text x="22" y="78" fill="#8b949e">wrote build/tiny.gguf</text>
+<text x="22" y="98" fill="#e6edf3"><tspan fill="#F97316">$</tspan> build/tinyinfer -m build/tiny.gguf -p "The capital of France is" -n 32 --temp 0 -t 6 -v</text>
+<text x="22" y="118" fill="#8b949e">[tinyinfer] qwen2: layers=2 dim=64 ffn=128 heads=4 kv_heads=2 head_dim=16 vocab=559 ctx=256</text>
+<text x="22" y="138" fill="#8b949e">  rope_theta=1e+06 tied=1 bias=1 weights=Q4_0 simd=avx2+f16c threads=6 backend=cpu load=0ms</text>
+<text x="22" y="158" fill="#e6edf3">The capital of France isssssssssssssssssssssssssssssssss</text>
+<text x="22" y="178" fill="#FDBA74">[tinyinfer] prefill: 18 tokens in 0.4 ms (41695.62 tok/s)</text>
+<text x="22" y="198" fill="#FDBA74">[tinyinfer] decode:  31 tokens in 1.8 ms (16867.08 tok/s)</text>
+<text x="22" y="218" fill="#e6edf3"><tspan fill="#F97316">$</tspan> build/tinyinfer -m build/tiny.gguf --bench 128,64 -t 6 -r 3</text>
+<text x="22" y="238" fill="#8b949e">| backend | threads | test | t/s (mean) | t/s (best) |</text>
+<text x="22" y="258" fill="#e6edf3">| avx2+f16c | 6 | pp128 | 65748.86 | 74657.34 |</text>
+<text x="22" y="278" fill="#e6edf3">| avx2+f16c | 6 | tg64 | 28393.78 | 32488.96 |</text>
+</g>
+<text x="22" y="312" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8b949e">Real output, captured by docs/assets/make_figures.py. Random weights: gibberish text, toy-size tok/s.</text>
+</svg>
