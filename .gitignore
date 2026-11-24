@@ -1,0 +1,32 @@
+# build outputs
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.lib
+a.out
+.zig-cache/
+zig-out/
+
+# models and benchmark output (download with scripts/download_qwen.sh)
+models/
+*.gguf
+bench_results.md
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store

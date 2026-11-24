@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: linux (${{ matrix.simd }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - simd: avx2
+            arch: "-march=native"
+          - simd: scalar
+            arch: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: build (make)
+        run: make -j4 ARCH="${{ matrix.arch }}"
+      - name: C unit tests
+        run: ./build/test_core
+      - name: Python tests (C vs NumPy reference)
+        run: TI_NO_AUTOBUILD=1 python -m pytest -q tests
+      - name: sanitizers (ASan + UBSan)
+        if: matrix.simd == 'avx2'
+        run: |
+          python build.py --sanitize --out build-asan --only test_core tinyinfer
+          python scripts/make_tiny_model.py -o build-asan/tiny.gguf --type q4_0
+          ./build-asan/test_core
+          ./build-asan/tinyinfer -m build-asan/tiny.gguf -p "hello <|im_end|> world" -n 16 --temp 0.8
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt ziglang
+      - name: build (zig cc via build.py)
+        run: python build.py
+      - run: build\test_core.exe
+      - run: python -m pytest -q tests
+        env:
+          TI_NO_AUTOBUILD: "1"
+
+  # Cross-compile the core for aarch64 and run the C tests under qemu: this
+  # executes the NEON (+SDOT) kernels against the scalar reference and a
+  # NumPy-computed forward pass.
+  arm64-qemu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt ziglang
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: NEON compile check (apple_m1 + cortex_a72)
+        run: python build.py --check-neon
+      - name: cross build test_core (aarch64, dotprod)
+        run: python build.py --target aarch64-linux-musl --mcpu cortex_a76 --only test_core --out build-arm
+      - name: run under qemu
+        run: |
+          python scripts/make_tiny_model.py -o build-arm/tiny-q8.gguf --type q8_0 --seed 1
+          python - <<'EOF'
+          import sys; sys.path.insert(0, "python")
+          import numpy as np
+          from tinyinfer_ref.model import QwenRef
+          QwenRef("build-arm/tiny-q8.gguf").forward([5, 77, 300, 12]).astype(np.float32).tofile("build-arm/expected.bin")
+          EOF
+          qemu-aarch64-static ./build-arm/test_core build-arm/tiny-q8.gguf build-arm/expected.bin
+
+  # Real Apple Silicon runner: NEON CPU path natively + Metal build.
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: make -j4
+      - run: ./build/test_core
+      - run: TI_NO_AUTOBUILD=1 python -m pytest -q tests
+      - name: build Metal backend
+        run: make metal
+      - name: Metal backend vs reference (hosted runners may not expose a usable GPU)
+        continue-on-error: true
+        run: TI_NO_AUTOBUILD=1 python -m pytest -q tests/test_cli.py -k metal -rs
