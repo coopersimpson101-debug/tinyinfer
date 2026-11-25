@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/coopersimpson101-debug/tinyinfer/actions/workflows/ci.yml"><img src="https://github.com/coopersimpson101-debug/tinyinfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+[![Release](https://img.shields.io/github/v/release/coopersimpson101-debug/tinyinfer?color=F97316&label=release)](https://github.com/coopersimpson101-debug/tinyinfer/releases/latest)
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/language-C11-F97316.svg" alt="C11">
   <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="no dependencies">

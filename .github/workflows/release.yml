@@ -1,0 +1,60 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build a release for"
+        required: true
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-arm64 }
+          - { os: windows-latest, name: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - if: runner.os != 'Windows'
+        run: make -j4 && ./build/test_core
+      - if: runner.os == 'macOS'
+        run: make metal
+      - if: runner.os == 'Windows'
+        run: pip install ziglang && python build.py && build\test_core.exe
+      - name: Package
+        shell: bash
+        run: |
+          d=tinyinfer-${{ matrix.name }}; mkdir -p $d
+          for f in tinyinfer tinyinfer-quantize tinyinfer-metal tinyinfer.exe tinyinfer-quantize.exe; do [ -f build/$f ] && cp build/$f $d/ || true; done
+          cp LICENSE README.md $d/
+          if [ "$RUNNER_OS" = Windows ]; then 7z a $d.zip $d >/dev/null; else tar czf $d.tar.gz $d; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinyinfer-${{ matrix.name }}
+          path: tinyinfer-${{ matrix.name }}.*
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: .github/release/${{ github.event.inputs.tag || github.ref_name }}.md
+          fail_on_unmatched_files: true
+          files: out/*
