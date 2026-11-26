@@ -5,6 +5,9 @@
 #include "../include/tinyinfer.h"
 #include "gguf.h"
 #include "tokenizer.h"
+#include "kvcache.h"
+
+#define TI_MAX_SEQS 16
 
 typedef struct {
     int type;          /* ti_type */
@@ -29,6 +32,10 @@ struct ti_model {
 
     /* KV cache: [n_layers][max_ctx][n_kv_heads * head_dim], f32 */
     float *k_cache, *v_cache;
+    /* paged KV cache (ti_kv_enable_paged): replaces k_cache/v_cache when set */
+    int paged;
+    ti_kv_pool pool;
+    ti_kv_seq seqs[TI_MAX_SEQS];
     float *rope_inv_freq; /* [head_dim / 2] */
 
     /* activations for a batch of up to max_batch tokens */

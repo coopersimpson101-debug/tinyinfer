@@ -35,16 +35,20 @@ Regenerate with <code>python docs/assets/make_figures.py</code>.</sub></p>
 
 - **Zero dependencies:** ~3.8k lines of C11 + Metal plus libc/pthreads (Win32 threads on Windows); Python + NumPy only for tests.
 - **Quantised int8 matmuls:** Q8_0 / Q4_0 weights x Q8_0 activations, two `SDOT`s per 32-weight block on Apple Silicon, `maddubs` on AVX2, bit-exact with ggml's formats.
-- **Verified, not eyeballed:** 168 pytest cases + 112 C tests compare logits, tokens and bytes with a NumPy reference and the real Qwen2 regex.
+- **Verified, not eyeballed:** 197 pytest cases + 126 C tests compare logits, tokens and bytes with a NumPy reference and the real Qwen2 regex.
 - **Runs on 4 CI targets:** Linux AVX2 / scalar / ASan+UBSan, Windows (zig cc), aarch64 NEON under qemu, and a GitHub macOS arm64 runner (NEON natively + Metal GPU).
 - **Metal backend:** matvec for f32/f16/q8_0/q4_0, RMSNorm, RoPE, online-softmax attention, SwiGLU; GPU logits match NumPy to < 1e-3 x std on the CI runner.
+- **Speculative decoding + paged KV cache:** exact rejection-sampling verification (greedy output identical to the target alone) gave ≈ 2× decode speed with a from-scratch 3.15M draft for a 25.7M target ([tinylm](https://github.com/coopersimpson101-debug/tinylm)) on a Ryzen 5 3600; block-table attention is bit-identical to the contiguous cache.
 - **Real-size speed on a desktop CPU:** 68.5 tok/s decode for Qwen2.5-0.5B-shaped Q4_0, 22.5 tok/s for 1.5B (Ryzen 5 3600, random weights).
 
 ## Status
 
 | | what | where it was checked |
 |---|---|---|
-| ✅ | CPU engine, scalar + AVX2: full test-suite (168 passed, 112 C tests) | Windows 10 / Ryzen 5 3600 here; Linux CI (+ ASan/UBSan) |
+| ✅ | CPU engine, scalar + AVX2: full test-suite (197 passed, 126 C tests) | Windows 10 / Ryzen 5 3600 here; Linux CI (+ ASan/UBSan) |
+| ✅ | Paged KV cache (CPU): bit-identical logits vs contiguous, multi-sequence, rollback, fork/CoW | here (pytest + `test_core`) |
+| ✅ | Speculative decoding: exact acceptance rule, greedy == target, tok/s with/without | here, Ryzen 5 3600, with tinylm's 25.7M + 3.15M models |
+| ⏳ | Paged KV cache on the Metal backend | not implemented: `--kv-paged` is rejected with `--metal` |
 | ✅ | NEON + SDOT kernels and full test-suite, natively | GitHub macOS arm64 runner (CI `macos-arm64`) |
 | ✅ | Metal backend builds; 5 GPU-vs-NumPy logit tests pass | GitHub macOS arm64 runner (toy models only) |
 | 🧪 | NEON kernels on `cortex-a76` + forward pass vs NumPy | qemu-aarch64 in CI (emulated) |
@@ -80,7 +84,9 @@ scripts/download_qwen.sh && build/tinyinfer -m models/qwen2.5-1.5b-instruct-q8_0
 | GGUF writer / re-quantiser | `src/quantize_main.c` | `tinyinfer-quantize in.gguf out.gguf q4_0` ("pure" Q4_0, readable by llama.cpp too) |
 | byte-level BPE tokenizer | `src/tokenizer.c` | Qwen2 regex pre-tokeniser hand-written in C, merge ranks, special tokens, streaming-safe decode |
 | Qwen2 forward pass | `src/model.c` | RMSNorm, NeoX RoPE (theta from file), GQA, QKV bias, SwiGLU, tied/untied embeddings, batched prefill |
-| KV cache | `src/model.c` | preallocated f32 `[layer][pos][kv_dim]` |
+| KV cache | `src/model.c` | preallocated f32 `[layer][pos][kv_dim]` (default) |
+| paged KV cache | `src/kvcache.c`, `src/model.c` | block pool + free-list allocator, per-sequence block tables, 16 sequences, rollback, fork with copy-on-write; attention reads through the block table (CPU) |
+| speculative decoding | `src/speculative.c` | draft/target, k-token proposals, exact rejection-sampling acceptance (Leviathan et al. / Chen et al.), dense sampler distribution, acceptance stats |
 | quantisation | `src/quant.c` | Q8_0 / Q4_0 quantise + dequantise, bit-exact with ggml; fp16 <-> fp32 by hand |
 | matmul kernels | `src/kernels.c` | F32, F16, BF16, Q8_0, Q4_0 weights; int8 dot products; NEON (+SDOT), AVX2 (+F16C), scalar; 4-token blocked prefill kernel |
 | thread pool | `src/platform.c` | pthreads or native Win32, spin-then-sleep, dynamic chunking |
@@ -185,6 +191,84 @@ never be in the nucleus) → draw with a seeded xorshift64* RNG.
 chunks of 64 so weights are reused while they are in cache. See
 [docs/internals.md](docs/internals.md) for the pool's synchronisation design.
 
+### Paged KV cache and speculative decoding
+
+**Paged KV cache** (`src/kvcache.c`, after vLLM's PagedAttention, Kwon et al. 2023).
+`ti_kv_enable_paged(m, block_size, n_blocks)` replaces the contiguous
+`[layer][ctx][kv_dim]` cache with a pool of fixed-size blocks laid out as
+`pool[block][layer][slot][kv_dim]`. Each sequence (up to 16) has a block table
+mapping logical block `p / block_size` to a physical block; a free-list stack
+hands blocks out and takes them back. Position `p` of a sequence lives at
+`table[p / bs]`, slot `p % bs`, so the cache grows one block at a time instead
+of reserving `max_ctx` per sequence.
+
+```
+seq 0 table: [3, 0, 5]        pool:  0 [seq0 p16-31] 1 [free] 2 [seq1 p0-15]
+seq 1 table: [2, 6]                  3 [seq0 p0-15]  4 [free] 5 [seq0 p32-..]  6 [seq1 p16-..]
+```
+
+* The attention kernel walks the block table, visiting positions in exactly
+  the same order with the same online-softmax arithmetic as the contiguous
+  kernel, so logits are **bit-identical** (tested for F32/Q8_0/Q4_0, block sizes
+  1/3/16, batched prefill across block boundaries, interleaved sequences).
+* `ti_forward_seq(m, seq, tokens, n, pos, ...)` writing at `pos` first discards
+  the sequence's positions `>= pos` and returns whole blocks to the pool; this
+  is how rejected draft tokens are rolled back.
+* `ti_kv_seq_copy(dst, src)` forks a sequence by sharing its blocks
+  (reference counts); a write into a shared block copies it first
+  (copy-on-write), so forked prompts cost no memory until they diverge.
+* Pool exhaustion is a clean error that leaves the sequence untouched.
+
+**Speculative decoding** (`src/speculative.c`; Leviathan, Kalman & Matias 2023;
+Chen et al. 2023). A small draft model proposes `k` tokens
+`d_i ~ q_i`; the target scores `[x_last, d_1..d_k]` in **one batched forward**
+(which costs about as much as one decode step on a memory-bound CPU), giving
+`p_1..p_{k+1}`. For `i = 1..k`, `d_i` is kept with probability
+`min(1, p_i(d_i) / q_i(d_i))`; at the first rejection the token is resampled
+from the residual `norm(max(0, p_i - q_i))` and the round ends; if all `k`
+survive, a bonus token is drawn from `p_{k+1}`. Each round therefore emits
+between 1 and `k + 1` tokens for a single target call.
+
+<details>
+<summary>Why the output distribution is exactly the target's</summary>
+
+For one drafted position with draft distribution `q` and target `p`:
+
+```
+P(emit x) = q(x) · min(1, p(x)/q(x))  +  P(reject) · r(x)
+          = min(p(x), q(x))          +  (Σ_y max(0, p(y) − q(y))) · max(0, p(x) − q(x)) / Σ_y max(0, p(y) − q(y))
+          = min(p(x), q(x)) + max(0, p(x) − q(x))  =  p(x)
+```
+
+using `P(reject) = 1 − Σ_y min(p, q) = Σ_y max(0, p − q)`. Positions after a
+rejection are re-drafted next round from the corrected prefix, so by induction
+the whole sequence has the target's law. With greedy decoding `p` and `q` are
+one-hot and the rule reduces to "keep `d_i` iff it equals the target's argmax",
+so the output is token-for-token identical to greedy decoding with the target
+alone. The distribution `ti_sampler_probs` gives both models is the dense
+temperature / top-k / top-p distribution (repetition penalty is disabled in this
+mode because it would make `p` history-dependent in a way the draft cannot see).
+</details>
+
+Tests (`tests/test_speculative.py`): the acceptance rule applied to 200,000
+draws reproduces `p` to TV distance < 0.006 (also when `q` misses part of
+`p`'s support) and accepts with probability `Σ min(p, q)`; greedy speculative
+output equals greedy target output for k = 1, 3, 6 with the contiguous and the
+paged cache and for a Q4_0 target; draft == target accepts everything (6 rounds
+for 30 tokens at k = 4); at temperature 1.5 / top-k 8 the first emitted token's
+empirical law over 3,000 seeded runs matches the target's to TV < 0.04; the
+CLI produces identical text with and without `--draft` / `--kv-paged`.
+
+```bash
+build/tinyinfer -m target.gguf --draft draft.gguf --spec-k 4 -p "Once upon a time" -n 256 --temp 0
+build/tinyinfer -m target.gguf --spec-baseline ...   # same sampler code path, no draft (fair baseline)
+build/tinyinfer -m target.gguf --kv-paged --kv-block 16 ...
+```
+
+stderr then reports
+`[tinyinfer] speculative: k=4 rounds=… drafted=… accepted=… acceptance=…% tokens/round=…`.
+
+
 ## Build and run
 
 Requirements: a C11 compiler. Python 3 + NumPy only for tests/scripts.
@@ -229,7 +313,9 @@ The CLI prints the generated text on stdout and timing on stderr:
 
 Options: `-n` tokens, `-t` threads, `-c` context, `--temp`, `--top-k`,
 `--top-p`, `--repeat-penalty`, `--repeat-last-n`, `-s` seed, `--chat`,
-`--system`, `--ignore-eos`, `--bench PP,TG`, `-v`.
+`--system`, `--ignore-eos`, `--bench PP,TG`, `-v`, and for this release
+`--kv-paged`, `--kv-block N`, `--kv-blocks N`, `--draft PATH`, `--spec-k N`,
+`--spec-baseline` (see [Paged KV cache and speculative decoding](#paged-kv-cache-and-speculative-decoding)).
 
 No model? `python scripts/make_tiny_model.py -o build/tiny.gguf --type q4_0`
 writes a random 2-layer Qwen2 with a real trained BPE tokenizer
@@ -255,14 +341,16 @@ What is tested (all against independent implementations, not against itself):
 | sampler | greedy; temperature distributions vs softmax (20k draws); top-k / top-p support sets; repetition penalty; seed determinism |
 | end to end | CLI greedy output == NumPy greedy decode + Python detokeniser; `--bench`; chat + seeded sampling reproducible; `tinyinfer-quantize` output byte-identical to the Python quantiser |
 | Metal | GPU logits vs float reference (skipped unless `build/tinyinfer-metal` exists) |
+| paged KV cache | allocator (alloc order, exhaustion leaves the sequence intact, truncate, fork, copy-on-write, all blocks returned) in C; logits bit-identical to the contiguous cache for F32/Q8_0/Q4_0 × block size 1/3/16, batched prefill across blocks, two interleaved sequences, rollback, fork |
+| speculative decoding | dense sampler distribution == NumPy; acceptance rule over 200k draws reproduces `p` (TV < 0.006) with acceptance rate Σ min(p, q); greedy speculative == greedy target (k = 1/3/6, contiguous and paged, F32 and Q4_0 targets); draft == target accepts everything; first-token law at T = 1.5 matches the target over 3,000 runs; CLI output identical with/without `--draft` / `--kv-paged` |
 
 Last local run (Windows 10, Ryzen 5 3600, zig cc 0.17.1 (`pip install ziglang`) via `build.py`):
-`168 passed, 5 skipped` (the 5 skipped are the Metal tests); `test_core`:
-`112 passed, 0 failed`; the same suite also passes with `--portable` (scalar
+`197 passed, 5 skipped` (the 5 skipped are the Metal tests); `test_core`:
+`126 passed, 0 failed` (branch `feat/spec-decode-paged-kv`, 2026-11-26); the same suite also passes with `--portable` (scalar
 kernels). CI (`.github/workflows/ci.yml`) runs the same suites on Linux AVX2 + scalar +
 ASan/UBSan, Windows (zig), aarch64 under qemu (NEON/SDOT kernels and a full
 forward pass vs NumPy) and a GitHub macOS arm64 runner (NEON natively:
-`test_core` reports `simd path: neon-dotprod`, `112 passed`; pytest `168 passed`;
+`test_core` reports `simd path: neon-dotprod`, `112 passed`; pytest `168 passed` (v0.1.0, before the paged-KV / speculative work, which CI has not run yet);
 then `make metal` and the 5 Metal tests: `5 passed`).
 
 ## Results
@@ -274,6 +362,43 @@ Relative L2 error of the logits vs the F32 model with the same weights
 better): F16 ≈ 0.1 %, Q8_0 ≈ 3 %, Q4_0 ≈ 29 %. C vs NumPy reference with the
 same format: max |Δ| / std(logits) < 1e-5 (F32/F16) and < 2e-2 (Q8_0/Q4_0,
 the residual being rare Q8_0 activation-rounding flips).
+
+### Speculative decoding with real trained models (measured here)
+
+Target: [tinylm](https://github.com/coopersimpson101-debug/tinylm)'s `tl-25m` (25.7M parameters, F32 GGUF,
+trained from scratch on TinyStoriesV2); draft: `tl-3m` (3.15M, same tokenizer). Both exported by tinylm and
+loaded unmodified. Machine: Ryzen 5 3600, Windows 10, `build.py` (zig cc, AVX2), 2026-11-26, **while other jobs
+kept the CPU at 100 % load**, so single runs vary 2-3x; configurations were interleaved round-robin and the
+medians are reported. Produced by `scripts/bench_spec.py` in tinylm (raw data: its `results/spec_bench.json`).
+
+<p align="center"><img src="docs/assets/spec_speed.png" alt="decode tok/s with and without speculative decoding" width="80%"></p>
+
+| temperature | configuration | decode tok/s, median (min-max) | speed-up | acceptance | tokens / target call |
+|---|---|---:|---:|---:|---:|
+| 0 | tl-25m alone | 62.3 (37-106) | 1.00× | - | - |
+| 0 | tl-3m alone (draft) | 895.2 (372-1787) | - | - | - |
+| 0 | spec k=1 | 70.6 (44-123) | 1.13× | 78.6 % | 1.78 |
+| 0 | spec k=2 | 119.1 (50-153) | 1.91× | 69.2 % | 2.38 |
+| 0 | spec k=3 | 122.1 (72-164) | 1.96× | 64.0 % | 2.90 |
+| 0 | spec k=4 | 80.7 (51-153) | 1.29× | 57.8 % | 3.28 |
+| 0 | spec k=6 | 124.6 (53-144) | 2.00× | 49.1 % | 3.89 |
+| 0 | spec k=8 | 61.8 (48-145) | 0.99× | 40.0 % | 4.12 |
+| 0 | spec k=4 paged | 75.8 (58-151) | 1.22× | 57.8 % | 3.28 |
+| 0.8 | tl-25m alone | 43.5 (19-102) | 1.00× | - | - |
+| 0.8 | tl-3m alone (draft) | 712.2 (325-1520) | - | - | - |
+| 0.8 | spec k=1 | 68.4 (46-118) | 1.57× | 78.6 % | 1.78 |
+| 0.8 | spec k=2 | 109.4 (61-158) | 2.51× | 67.9 % | 2.35 |
+| 0.8 | spec k=3 | 95.9 (58-157) | 2.20× | 60.8 % | 2.81 |
+| 0.8 | spec k=4 | 76.1 (48-162) | 1.75× | 55.1 % | 3.19 |
+| 0.8 | spec k=6 | 65.7 (48-121) | 1.51× | 46.0 % | 3.72 |
+| 0.8 | spec k=8 | 58.2 (43-105) | 1.34× | 38.1 % | 3.99 |
+| 0.8 | spec k=4 paged | 110.1 (59-163) | 2.53× | 55.1 % | 3.19 |
+
+256 new tokens per run, 3 prompts x 3 seeds per configuration, configurations interleaved round-robin, 3 threads, top-k 40, repetition penalty off, `--ignore-eos`; date 2026-11-26.
+
+All 63 greedy speculative runs produced exactly the same text as the target alone. Acceptance rate and tokens
+per target call are deterministic for a given prompt/seed and do not depend on machine load; the tok/s
+differences between neighbouring `k`, and between paged and contiguous KV, are within the run-to-run noise.
 
 ### CPU speed on this dev machine (NOT an M1, NOT real weights)
 
@@ -421,13 +546,18 @@ Items 3-5 have not been run. Commands are exact; paste the output into the table
 - [ ] More formats: Q4_K / Q6_K so the official Q4_K_M files load directly.
 - [ ] Qwen3 (QK-norm, no QKV bias) and Llama (interleaved RoPE) architectures.
 - [ ] Exact Unicode categories in the pre-tokeniser (generated tables).
-- [ ] Speculative decoding with Qwen2.5-0.5B as the draft model.
+- [x] Speculative decoding (CPU), measured with the from-scratch tinylm 25M/3M pair.
+- [x] Paged KV cache on the CPU path, bit-identical to the contiguous cache.
+- [ ] Paged KV cache on Metal (block-table indirection in `kernels.metal`), and continuous batching on top of it.
+- [ ] Speculative decoding with Qwen2.5-0.5B drafting for 1.5B (real weights; needs the downloads).
+- [ ] Tree / multi-candidate drafts (SpecInfer-style) and a learned draft head (Medusa / EAGLE).
 
 ## Repository layout
 
 ```
 include/tinyinfer.h        public C API (also used from Python via ctypes)
-src/                       engine: gguf, tokenizer, model, kernels, quant, sampler, platform, CLI
+src/                       engine: gguf, tokenizer, model, kernels, quant, sampler, platform, CLI,
+                           kvcache (paged KV), speculative (draft/verify decoding)
 metal/                     Metal host (.m) + shaders (.metal)
 python/tinyinfer_ref/      NumPy reference: GGUF I/O, quant formats, BPE, Qwen2 forward, ctypes API
 scripts/                   make_tiny_model.py, download_qwen.sh, bench.sh, validate_hf.py

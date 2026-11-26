@@ -64,6 +64,23 @@ TI_API const char *ti_last_error(void);
 TI_API int ti_forward(ti_model *m, const int32_t *tokens, int n, int pos,
                       float *logits, int all_logits);
 
+/* ---- paged KV cache ------------------------------------------------------
+ * Switch the model from one contiguous [layers][ctx][kv] cache to a pool of
+ * n_blocks blocks of block_size positions (block_size <= 0 -> 16; n_blocks <= 0
+ * -> enough for one max_ctx sequence). Up to 16 sequences then share the pool
+ * via ti_forward_seq. Writing at position p of a sequence discards its cached
+ * positions >= p (this is how rejected draft tokens are rolled back).
+ * CPU backend only. */
+TI_API int ti_kv_enable_paged(ti_model *m, int block_size, int n_blocks);
+TI_API int ti_kv_is_paged(const ti_model *m);
+TI_API int ti_forward_seq(ti_model *m, int seq_id, const int32_t *tokens, int n, int pos,
+                          float *logits, int all_logits);
+TI_API int ti_kv_seq_trim(ti_model *m, int seq_id, int n_pos); /* keep [0, n_pos) */
+TI_API int ti_kv_seq_copy(ti_model *m, int dst, int src);      /* share blocks (CoW) */
+TI_API int ti_kv_seq_len(const ti_model *m, int seq_id);
+TI_API int ti_kv_blocks_free(const ti_model *m);
+TI_API int ti_kv_blocks_total(const ti_model *m);
+
 /* ---- tokenizer ----------------------------------------------------------- */
 /* Returns the number of tokens written (or needed if > max_tokens), <0 on error. */
 TI_API int ti_tokenize(const ti_model *m, const char *text, int32_t *out,
@@ -109,6 +126,39 @@ TI_API ti_sampler_params ti_sampler_default(void);
  * rng_state is a xorshift64* state (non-zero). */
 TI_API int ti_sample(float *logits, int n_vocab, const ti_sampler_params *p,
                      const int32_t *history, int n_history, uint64_t *rng_state);
+
+/* ---- speculative decoding --------------------------------------------------
+ * Draft-then-verify decoding (Leviathan et al. 2023; Chen et al. 2023). The
+ * draft proposes k tokens x_i ~ q_i; the target scores all of them in one
+ * batched forward; x_i is kept with probability min(1, p_i(x_i) / q_i(x_i)),
+ * and the first rejected position is resampled from norm(max(0, p_i - q_i)).
+ * If all k are accepted a bonus token is drawn from p_{k+1}. The output
+ * sequence is distributed exactly as sampling from the target alone. */
+typedef struct ti_spec_stats {
+    int rounds;       /* target verification calls */
+    int drafted;      /* draft tokens proposed */
+    int accepted;     /* draft tokens accepted */
+    int generated;    /* tokens emitted */
+    double t_prefill, t_draft, t_target, t_total; /* seconds (t_total includes prefill) */
+} ti_spec_stats;
+
+/* Dense next-token distribution under (temperature, top_k, top_p); greedy
+ * (temperature <= 0) gives a one-hot argmax. Repetition penalty is ignored. */
+TI_API void ti_sampler_probs(const float *logits, int n, const ti_sampler_params *p, float *probs);
+/* Draw from a dense distribution with the xorshift64* state. */
+TI_API int ti_sample_from(const float *probs, int n, uint64_t *rng);
+/* The acceptance rule for one drafted token. Returns the emitted token and
+ * sets *accepted. `scratch` must hold n floats. */
+TI_API int ti_spec_accept(const float *p, const float *q, int n, int draft_token, float *scratch,
+                          uint64_t *rng, int *accepted);
+/* Plain autoregressive generation through the same sampling path (baseline).
+ * Writes up to n_predict tokens to out, returns the count (<0 on error). */
+TI_API int ti_generate(ti_model *m, const int32_t *prompt, int n_prompt, int n_predict,
+                       const ti_sampler_params *p, int stop_at_eos, int32_t *out,
+                       ti_spec_stats *stats);
+TI_API int ti_spec_generate(ti_model *target, ti_model *draft, const int32_t *prompt,
+                            int n_prompt, int n_predict, int k, const ti_sampler_params *p,
+                            int stop_at_eos, int32_t *out, ti_spec_stats *stats);
 
 #ifdef __cplusplus
 }

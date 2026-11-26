@@ -100,6 +100,10 @@ TI_API void ti_model_free(ti_model *m) {
     if (m->metal) ti_metal_free(m->metal);
 #endif
     ti_tokenizer_free(&m->tok);
+    if (m->paged) {
+        for (int i = 0; i < TI_MAX_SEQS; i++) ti_kv_seq_release(&m->pool, &m->seqs[i]);
+        ti_kv_pool_destroy(&m->pool);
+    }
     for (int i = 0; i < m->n_owned; i++) free(m->owned[i]);
     free(m->owned);
     free(m->layers);
@@ -249,7 +253,23 @@ static void rope_neox(float *v, int n_heads, int hd, const float *cs, const floa
 typedef struct {
     const ti_model *m;
     int layer, n, pos;
+    const ti_kv_seq *seq; /* paged mode only */
 } attn_job;
+
+/* online-softmax update of (mx, l, out) with one key/value row */
+static inline void attn_accum(const float *q, const float *k, const float *v, int hd, float scale,
+                              float *mx, float *l, float *out) {
+    float sc = ti_dot_f32(q, k, hd) * scale;
+    if (sc > *mx) {
+        float r = expf(*mx - sc); /* exp(-inf) = 0 on the first step */
+        *l *= r;
+        for (int i = 0; i < hd; i++) out[i] *= r;
+        *mx = sc;
+    }
+    float w = expf(sc - *mx);
+    *l += w;
+    for (int i = 0; i < hd; i++) out[i] += w * v[i];
+}
 
 /* one task = one (token, head) pair */
 static void attn_task(void *vctx, int s, int e) {
@@ -258,8 +278,8 @@ static void attn_task(void *vctx, int s, int e) {
     const int hd = c->head_dim, KVD = c->n_kv_heads * hd, QD = c->n_heads * hd;
     const int group = c->n_heads / c->n_kv_heads;
     const float scale = 1.0f / sqrtf((float)hd);
-    const float *kc = j->m->k_cache + (size_t)j->layer * c->max_ctx * KVD;
-    const float *vc = j->m->v_cache + (size_t)j->layer * c->max_ctx * KVD;
+    const float *kc = j->seq ? NULL : j->m->k_cache + (size_t)j->layer * c->max_ctx * KVD;
+    const float *vc = j->seq ? NULL : j->m->v_cache + (size_t)j->layer * c->max_ctx * KVD;
     for (int task = s; task < e; task++) {
         int t = task / c->n_heads, h = task % c->n_heads;
         int kvh = h / group;
@@ -268,19 +288,20 @@ static void attn_task(void *vctx, int s, int e) {
         int last = j->pos + t; /* causal: attend to positions 0..last */
         float mx = -INFINITY, l = 0.0f;
         for (int i = 0; i < hd; i++) out[i] = 0.0f;
-        for (int p = 0; p <= last; p++) {
-            const float *k = kc + (size_t)p * KVD + kvh * hd;
-            float sc = ti_dot_f32(q, k, hd) * scale;
-            const float *v = vc + (size_t)p * KVD + kvh * hd;
-            if (sc > mx) {
-                float r = expf(mx - sc); /* exp(-inf) = 0 on the first step */
-                l *= r;
-                for (int i = 0; i < hd; i++) out[i] *= r;
-                mx = sc;
+        if (!j->seq) {
+            for (int p = 0; p <= last; p++)
+                attn_accum(q, kc + (size_t)p * KVD + kvh * hd, vc + (size_t)p * KVD + kvh * hd, hd,
+                           scale, &mx, &l, out);
+        } else { /* paged: walk the block table, same visiting order as above */
+            const ti_kv_pool *P = &j->m->pool;
+            const int bs = P->block_size;
+            for (int b = 0; b * bs <= last; b++) {
+                const size_t base = ti_kv_offset(P, j->seq->table[b], j->layer, 0) + (size_t)kvh * hd;
+                const int n_slot = (last - b * bs + 1) < bs ? (last - b * bs + 1) : bs;
+                for (int sl = 0; sl < n_slot; sl++)
+                    attn_accum(q, P->k + base + (size_t)sl * KVD, P->v + base + (size_t)sl * KVD, hd,
+                               scale, &mx, &l, out);
             }
-            float w = expf(sc - mx);
-            l += w;
-            for (int i = 0; i < hd; i++) out[i] += w * v[i];
         }
         float inv = 1.0f / l;
         for (int i = 0; i < hd; i++) out[i] *= inv;
@@ -295,8 +316,8 @@ static inline float silu(float x) { return x / (1.0f + expf(-x)); }
 
 /* forward for n <= max_batch tokens; writes logits for all n tokens (all=1) or
  * only for the last one */
-static int forward_chunk(ti_model *m, const int32_t *tokens, int n, int pos, float *logits,
-                         int all) {
+static int forward_chunk(ti_model *m, ti_kv_seq *seq, const int32_t *tokens, int n, int pos,
+                         float *logits, int all) {
     const ti_config *c = &m->cfg;
     const int D = c->dim, hd = c->head_dim, QD = c->n_heads * hd, KVD = c->n_kv_heads * hd;
     const int F = c->ffn_dim;
@@ -317,8 +338,8 @@ static int forward_chunk(ti_model *m, const int32_t *tokens, int n, int pos, flo
         mm(&L->wq, m->xb, m->q, n);
         mm(&L->wk, m->xb, m->k, n);
         mm(&L->wv, m->xb, m->v, n);
-        float *kc = m->k_cache + (size_t)l * c->max_ctx * KVD;
-        float *vc = m->v_cache + (size_t)l * c->max_ctx * KVD;
+        float *kc = seq ? NULL : m->k_cache + (size_t)l * c->max_ctx * KVD;
+        float *vc = seq ? NULL : m->v_cache + (size_t)l * c->max_ctx * KVD;
         for (int t = 0; t < n; t++) {
             float *q = m->q + (size_t)t * QD, *k = m->k + (size_t)t * KVD, *v = m->v + (size_t)t * KVD;
             if (L->bq) for (int i = 0; i < QD; i++) q[i] += L->bq[i];
@@ -332,10 +353,20 @@ static int forward_chunk(ti_model *m, const int32_t *tokens, int n, int pos, flo
             }
             rope_neox(q, c->n_heads, hd, cs, sn);
             rope_neox(k, c->n_kv_heads, hd, cs, sn);
-            memcpy(kc + (size_t)p * KVD, k, sizeof(float) * KVD);
-            memcpy(vc + (size_t)p * KVD, v, sizeof(float) * KVD);
+            float *kd, *vd;
+            if (seq) {
+                size_t off = ti_kv_offset(&m->pool, seq->table[p / m->pool.block_size], l,
+                                          p % m->pool.block_size);
+                kd = m->pool.k + off;
+                vd = m->pool.v + off;
+            } else {
+                kd = kc + (size_t)p * KVD;
+                vd = vc + (size_t)p * KVD;
+            }
+            memcpy(kd, k, sizeof(float) * KVD);
+            memcpy(vd, v, sizeof(float) * KVD);
         }
-        attn_job aj = {m, l, n, pos};
+        attn_job aj = {m, l, n, pos, seq};
         ti_parallel_for(n * c->n_heads, 1, attn_task, &aj);
         mm(&L->wo, m->att, m->tmp, n);
         for (size_t i = 0; i < (size_t)n * D; i++) m->x[i] += m->tmp[i];
@@ -356,11 +387,30 @@ static int forward_chunk(ti_model *m, const int32_t *tokens, int n, int pos, flo
     return 0;
 }
 
-TI_API int ti_forward(ti_model *m, const int32_t *tokens, int n, int pos, float *logits,
-                      int all_logits) {
+TI_API int ti_forward_seq(ti_model *m, int seq_id, const int32_t *tokens, int n, int pos,
+                          float *logits, int all_logits) {
     if (n <= 0) return 0;
     if (pos < 0 || pos + n > m->cfg.max_ctx) {
         ti_set_error("context overflow: pos %d + %d tokens > ctx %d", pos, n, m->cfg.max_ctx);
+        return -1;
+    }
+    ti_kv_seq *seq = NULL;
+    if (m->paged) {
+        if (seq_id < 0 || seq_id >= TI_MAX_SEQS) {
+            ti_set_error("sequence id %d out of range [0, %d)", seq_id, TI_MAX_SEQS);
+            return -1;
+        }
+        seq = &m->seqs[seq_id];
+        if (pos > seq->len) {
+            ti_set_error("sequence %d has %d cached positions; cannot write at %d", seq_id,
+                         seq->len, pos);
+            return -1;
+        }
+        /* writing at pos discards everything cached from pos on (rollback) */
+        ti_kv_seq_truncate(&m->pool, seq, pos);
+        if (ti_kv_seq_prepare(&m->pool, seq, pos, pos + n) != 0) return -1;
+    } else if (seq_id != 0) {
+        ti_set_error("sequence ids other than 0 need the paged KV cache (ti_kv_enable_paged)");
         return -1;
     }
 #ifdef TI_METAL
@@ -380,10 +430,65 @@ TI_API int ti_forward(ti_model *m, const int32_t *tokens, int n, int pos, float 
         float *out = NULL;
         if (all_logits) out = logits + (size_t)s * V;
         else if (last_chunk) out = logits;
-        if (forward_chunk(m, tokens + s, cnt, pos + s, out, all_logits) != 0) return -1;
+        if (forward_chunk(m, seq, tokens + s, cnt, pos + s, out, all_logits) != 0) return -1;
+        if (seq) seq->len = pos + s + cnt;
     }
     return 0;
 }
+
+TI_API int ti_forward(ti_model *m, const int32_t *tokens, int n, int pos, float *logits,
+                      int all_logits) {
+    return ti_forward_seq(m, 0, tokens, n, pos, logits, all_logits);
+}
+
+/* ------------------------------------------------------- paged KV cache --- */
+TI_API int ti_kv_enable_paged(ti_model *m, int block_size, int n_blocks) {
+    if (m->metal) {
+        ti_set_error("the paged KV cache is implemented for the CPU backend only");
+        return -1;
+    }
+    if (m->paged) {
+        ti_set_error("paged KV cache already enabled");
+        return -1;
+    }
+    const ti_config *c = &m->cfg;
+    if (block_size <= 0) block_size = 16;
+    if (n_blocks <= 0) n_blocks = (c->max_ctx + block_size - 1) / block_size;
+    if (ti_kv_pool_init(&m->pool, n_blocks, block_size, c->n_layers,
+                        c->n_kv_heads * c->head_dim) != 0)
+        return -1;
+    free(m->k_cache);
+    free(m->v_cache);
+    m->k_cache = m->v_cache = NULL;
+    memset(m->seqs, 0, sizeof m->seqs);
+    m->paged = 1;
+    return 0;
+}
+
+TI_API int ti_kv_is_paged(const ti_model *m) { return m->paged; }
+
+TI_API int ti_kv_seq_trim(ti_model *m, int seq_id, int n_pos) {
+    if (!m->paged) return 0; /* contiguous cache: stale positions are simply overwritten */
+    if (seq_id < 0 || seq_id >= TI_MAX_SEQS) return -1;
+    ti_kv_seq_truncate(&m->pool, &m->seqs[seq_id], n_pos);
+    return 0;
+}
+
+TI_API int ti_kv_seq_copy(ti_model *m, int dst, int src) {
+    if (!m->paged || dst < 0 || src < 0 || dst >= TI_MAX_SEQS || src >= TI_MAX_SEQS) {
+        ti_set_error("ti_kv_seq_copy needs the paged KV cache and valid sequence ids");
+        return -1;
+    }
+    return ti_kv_seq_fork(&m->pool, &m->seqs[dst], &m->seqs[src]);
+}
+
+TI_API int ti_kv_seq_len(const ti_model *m, int seq_id) {
+    if (!m->paged || seq_id < 0 || seq_id >= TI_MAX_SEQS) return -1;
+    return m->seqs[seq_id].len;
+}
+
+TI_API int ti_kv_blocks_free(const ti_model *m) { return m->paged ? m->pool.n_free : -1; }
+TI_API int ti_kv_blocks_total(const ti_model *m) { return m->paged ? m->pool.n_blocks : -1; }
 
 /* ----------------------------------------------------------- tokenizer --- */
 TI_API int ti_tokenize(const ti_model *m, const char *text, int32_t *out, int max_tokens,

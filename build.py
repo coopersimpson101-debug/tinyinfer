@@ -26,7 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
-LIB_SRCS = ["platform.c", "quant.c", "kernels.c", "gguf.c", "tokenizer.c", "model.c", "sampler.c"]
+LIB_SRCS = ["platform.c", "quant.c", "kernels.c", "gguf.c", "tokenizer.c", "model.c", "sampler.c", "kvcache.c", "speculative.c"]
 
 
 def find_zig():
