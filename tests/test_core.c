@@ -10,6 +10,7 @@
 #include "../include/tinyinfer.h"
 #include "../src/kernels.h"
 #include "../src/quant.h"
+#include "../src/kvcache.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -226,6 +227,42 @@ static int test_model(const char *model, const char *expected) {
     return 0;
 }
 
+/* paged KV cache allocator: alloc / exhaustion / reuse / fork + copy-on-write */
+static void test_kv_pool(void) {
+    ti_kv_pool p;
+    CHECK(ti_kv_pool_init(&p, 4, 2, 3, 8) == 0, "pool init");
+    CHECK(p.n_free == 4, "all blocks free");
+    ti_kv_seq a, b;
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    CHECK(ti_kv_seq_prepare(&p, &a, 0, 5) == 0 && a.n_blocks == 3, "5 positions -> 3 blocks");
+    CHECK(a.table[0] == 0 && a.table[1] == 1 && a.table[2] == 2, "blocks handed out in order");
+    a.len = 5;
+    CHECK(ti_kv_seq_prepare(&p, &b, 0, 4) == -1 && b.n_blocks == 0, "exhaustion leaves seq untouched");
+    /* write a recognisable value into a's block 0, layer 2, slot 1 */
+    p.k[ti_kv_offset(&p, a.table[0], 2, 1) + 3] = 42.0f;
+    ti_kv_seq_truncate(&p, &a, 2);
+    CHECK(a.n_blocks == 1 && p.n_free == 3 && a.len == 2, "truncate frees tail blocks");
+    CHECK(ti_kv_seq_fork(&p, &b, &a) == 0 && b.table[0] == a.table[0], "fork shares blocks");
+    CHECK(p.refcount[a.table[0]] == 2 && p.n_free == 3, "fork is O(1) in memory");
+    /* b writes position 1 (inside the shared block) -> copy-on-write */
+    CHECK(ti_kv_seq_prepare(&p, &b, 1, 2) == 0, "cow prepare");
+    CHECK(b.table[0] != a.table[0] && p.refcount[a.table[0]] == 1, "shared block was copied");
+    CHECK(p.k[ti_kv_offset(&p, b.table[0], 2, 1) + 3] == 42.0f, "copy carries the data");
+    /* a writing past its shared prefix does not copy */
+    ti_kv_seq c;
+    memset(&c, 0, sizeof c);
+    CHECK(ti_kv_seq_fork(&p, &c, &a) == 0, "fork 2");
+    int before = c.table[0];
+    CHECK(ti_kv_seq_prepare(&p, &c, 2, 3) == 0 && c.table[0] == before && c.n_blocks == 2,
+          "appending a new block keeps the shared prefix shared");
+    ti_kv_seq_release(&p, &a);
+    ti_kv_seq_release(&p, &b);
+    ti_kv_seq_release(&p, &c);
+    CHECK(p.n_free == 4, "all blocks returned (got %d)", p.n_free);
+    ti_kv_pool_destroy(&p);
+}
+
 int main(int argc, char **argv) {
     printf("tinyinfer test_core (simd path: %s)\n", ti_simd_path());
     test_fp16();
@@ -234,6 +271,7 @@ int main(int argc, char **argv) {
     test_matmul_threads();
     test_sampler();
     test_pretok();
+    test_kv_pool();
     if (argc >= 3) test_model(argv[1], argv[2]);
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

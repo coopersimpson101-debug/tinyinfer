@@ -3,6 +3,7 @@
  *
  *   tinyinfer -m model.gguf -p "prompt" -n 128 [--chat] [--temp 0.7] ...
  *   tinyinfer -m model.gguf --bench 512,128      (llama-bench style pp/tg)
+ *   tinyinfer -m target.gguf --draft draft.gguf --spec-k 4 -p "..."   (speculative)
  *
  * Generated text goes to stdout; model info and timings go to stderr.
  */
@@ -46,7 +47,14 @@ static void usage(void) {
             "  -r, --reps N            repetitions for --bench (default 3)\n"
             "  --metal                 run on the GPU (macOS builds with TI_METAL)\n"
             "  --dump-logits FILE      write the prompt's last-position logits (float32)\n"
-            "  -v, --verbose           print model information\n");
+            "  -v, --verbose           print model information\n"
+            "  --kv-paged              use the paged KV cache (block table + block pool)\n"
+            "  --kv-block N            positions per KV block (default 16)\n"
+            "  --kv-blocks N           blocks in the pool (default: enough for -c)\n"
+            "  --draft PATH            draft model for speculative decoding (same tokenizer)\n"
+            "  --spec-k N              draft tokens proposed per round (default 4)\n"
+            "  --spec-baseline         plain decoding through the speculative sampler path\n"
+            "                          (same sampling code, no draft; for tok/s comparisons)\n");
 }
 
 static char *read_file(const char *path) {
@@ -128,6 +136,73 @@ static int run_bench(ti_model *m, int pp, int tg, int reps) {
     return 0;
 }
 
+static void write_tokens(const ti_model *m, const int32_t *t, int n) {
+    char piece[256];
+    for (int i = 0; i < n; i++) {
+        int nb = ti_tok_piece_bytes(&m->tok, t[i], piece, (int)sizeof piece);
+        fwrite(piece, 1, (size_t)(nb < (int)sizeof piece ? nb : (int)sizeof piece), stdout);
+    }
+    fflush(stdout);
+}
+
+/* speculative decoding (or the --spec-baseline comparison run) */
+static int run_speculative(ti_model *m, const char *draft_path, int ctx, int threads, int kv_paged,
+                           int kv_block, int kv_blocks, const int32_t *toks, int n_prompt,
+                           int n_predict, int k, const ti_sampler_params *sp0, int ignore_eos,
+                           int chat, const char *prompt) {
+    ti_sampler_params sp = *sp0;
+    if (sp.repeat_penalty != 1.0f) {
+        fprintf(stderr, "[tinyinfer] note: repetition penalty is disabled in speculative mode "
+                        "(it would make the target distribution history-dependent)\n");
+        sp.repeat_penalty = 1.0f;
+    }
+    ti_model *d = NULL;
+    if (draft_path) {
+        d = ti_model_load(draft_path, ctx > 0 ? ctx : ti_model_config(m)->max_ctx, threads);
+        if (!d) {
+            fprintf(stderr, "error: draft: %s\n", ti_last_error());
+            return 1;
+        }
+        if (kv_paged && ti_kv_enable_paged(d, kv_block, kv_blocks) != 0) {
+            fprintf(stderr, "error: draft: %s\n", ti_last_error());
+            ti_model_free(d);
+            return 1;
+        }
+    }
+    if (!chat) write_tokens(m, toks, n_prompt);
+    int32_t *out = (int32_t *)malloc(sizeof(int32_t) * (size_t)(n_predict + 1));
+    ti_spec_stats st;
+    int n = d ? ti_spec_generate(m, d, toks, n_prompt, n_predict, k, &sp, !ignore_eos, out, &st)
+              : ti_generate(m, toks, n_prompt, n_predict, &sp, !ignore_eos, out, &st);
+    if (n < 0) {
+        fprintf(stderr, "\nerror: %s\n", ti_last_error());
+        free(out);
+        ti_model_free(d);
+        return 1;
+    }
+    int shown = n;
+    if (!ignore_eos && n > 0 && is_stop(m, out[n - 1])) shown--;
+    write_tokens(m, out, shown);
+    fputc('\n', stdout);
+    double dec = st.t_total - st.t_prefill;
+    fprintf(stderr,
+            "\n[tinyinfer] prefill: %d tokens in %.1f ms\n"
+            "[tinyinfer] decode:  %d tokens in %.1f ms (%.2f tok/s)%s\n",
+            n_prompt, st.t_prefill * 1e3, n, dec * 1e3, dec > 0 ? n / dec : 0.0,
+            kv_paged ? " [paged KV]" : "");
+    if (d)
+        fprintf(stderr,
+                "[tinyinfer] speculative: k=%d rounds=%d drafted=%d accepted=%d "
+                "acceptance=%.1f%% tokens/round=%.2f draft=%.1f ms target=%.1f ms\n",
+                k, st.rounds, st.drafted, st.accepted,
+                st.drafted ? 100.0 * st.accepted / st.drafted : 0.0,
+                st.rounds ? (double)n / st.rounds : 0.0, st.t_draft * 1e3, st.t_target * 1e3);
+    (void)prompt;
+    free(out);
+    ti_model_free(d);
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
@@ -138,6 +213,8 @@ int main(int argc, char **argv) {
     const char *dump_logits = NULL;
     int n_predict = 128, threads = 0, ctx = 0, chat = 0, ignore_eos = 0, verbose = 0;
     int bench_pp = -1, bench_tg = -1, reps = 3, use_metal = 0;
+    int kv_paged = 0, kv_block = 16, kv_blocks = 0, spec_k = 4, spec_baseline = 0;
+    const char *draft_path = NULL;
     ti_sampler_params sp = ti_sampler_default();
     int seed_set = 0;
     for (int i = 1; i < argc; i++) {
@@ -162,6 +239,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--metal")) use_metal = 1;
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) verbose = 1;
         else if (!strcmp(a, "--dump-logits")) dump_logits = NEXT();
+        else if (!strcmp(a, "--kv-paged")) kv_paged = 1;
+        else if (!strcmp(a, "--kv-block")) kv_block = atoi(NEXT());
+        else if (!strcmp(a, "--kv-blocks")) kv_blocks = atoi(NEXT());
+        else if (!strcmp(a, "--draft")) draft_path = NEXT();
+        else if (!strcmp(a, "--spec-k")) spec_k = atoi(NEXT());
+        else if (!strcmp(a, "--spec-baseline")) spec_baseline = 1;
         else if (!strcmp(a, "--bench")) {
             const char *b = NEXT();
             if (sscanf(b, "%d,%d", &bench_pp, &bench_tg) != 2) { usage(); return 1; }
@@ -195,6 +278,11 @@ int main(int argc, char **argv) {
         ti_model_free(m);
         return 1;
 #endif
+    }
+    if (kv_paged && ti_kv_enable_paged(m, kv_block, kv_blocks) != 0) {
+        fprintf(stderr, "error: %s\n", ti_last_error());
+        ti_model_free(m);
+        return 1;
     }
     if (verbose || bench_pp >= 0) {
         fprintf(stderr,
@@ -244,6 +332,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "error: prompt (%d tokens) exceeds context %d\n", n_prompt, c->max_ctx);
             return 1;
         }
+    }
+    if (draft_path || spec_baseline) {
+        int rc = run_speculative(m, draft_path, ctx, threads, kv_paged, kv_block, kv_blocks, toks,
+                                 n_prompt, n_predict, spec_k, &sp, ignore_eos, chat, prompt);
+        free(toks);
+        free(full);
+        free(file_text);
+        ti_model_free(m);
+        return rc;
     }
     float *logits = (float *)malloc(sizeof(float) * (size_t)c->vocab_size);
     if (!chat) {

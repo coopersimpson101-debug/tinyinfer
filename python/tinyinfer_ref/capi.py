@@ -18,6 +18,12 @@ class SamplerParams(C.Structure):
                 ("repeat_penalty", C.c_float), ("repeat_last_n", C.c_int), ("seed", C.c_uint64)]
 
 
+class SpecStats(C.Structure):
+    _fields_ = [("rounds", C.c_int), ("drafted", C.c_int), ("accepted", C.c_int),
+                ("generated", C.c_int), ("t_prefill", C.c_double), ("t_draft", C.c_double),
+                ("t_target", C.c_double), ("t_total", C.c_double)]
+
+
 class Config(C.Structure):
     _fields_ = [(n, C.c_int) for n in ("n_layers", "dim", "ffn_dim", "n_heads", "n_kv_heads",
                                        "head_dim", "vocab_size", "max_ctx", "train_ctx")] + \
@@ -56,6 +62,20 @@ def load_lib():
         "ti_simd_path": (C.c_char_p, []),
         "ti_sampler_default": (SamplerParams, []),
         "ti_sample": (I, [fp, I, C.POINTER(SamplerParams), ip, I, C.POINTER(C.c_uint64)]),
+        "ti_kv_enable_paged": (I, [P, I, I]),
+        "ti_kv_is_paged": (I, [P]),
+        "ti_forward_seq": (I, [P, I, ip, I, I, fp, I]),
+        "ti_kv_seq_trim": (I, [P, I, I]),
+        "ti_kv_seq_copy": (I, [P, I, I]),
+        "ti_kv_seq_len": (I, [P, I]),
+        "ti_kv_blocks_free": (I, [P]),
+        "ti_kv_blocks_total": (I, [P]),
+        "ti_sampler_probs": (None, [fp, I, C.POINTER(SamplerParams), fp]),
+        "ti_sample_from": (I, [fp, I, C.POINTER(C.c_uint64)]),
+        "ti_spec_accept": (I, [fp, fp, I, I, fp, C.POINTER(C.c_uint64), C.POINTER(C.c_int)]),
+        "ti_generate": (I, [P, ip, I, I, C.POINTER(SamplerParams), I, ip, C.POINTER(SpecStats)]),
+        "ti_spec_generate": (I, [P, P, ip, I, I, I, C.POINTER(SamplerParams), I, ip,
+                                 C.POINTER(SpecStats)]),
     }
     for name, (res, args) in sig.items():
         f = getattr(lib, name)
@@ -92,6 +112,35 @@ class Model:
         if rc != 0:
             raise RuntimeError(self.lib.ti_last_error().decode())
         return out
+
+    def forward_seq(self, seq, tokens, pos, all_logits=True):
+        t = np.ascontiguousarray(tokens, dtype=np.int32)
+        V = self.cfg.vocab_size
+        out = np.zeros((len(t) if all_logits else 1, V), dtype=np.float32)
+        rc = self.lib.ti_forward_seq(self.h, seq, iptr(t), len(t), pos, fptr(out), int(all_logits))
+        if rc != 0:
+            raise RuntimeError(self.lib.ti_last_error().decode())
+        return out
+
+    def enable_paged(self, block_size=16, n_blocks=0):
+        if self.lib.ti_kv_enable_paged(self.h, block_size, n_blocks) != 0:
+            raise RuntimeError(self.lib.ti_last_error().decode())
+
+    def generate(self, prompt_ids, n_predict, params, draft=None, k=4, stop_at_eos=False):
+        """Plain (draft=None) or speculative generation; returns (tokens, SpecStats)."""
+        p = np.ascontiguousarray(prompt_ids, dtype=np.int32)
+        out = np.zeros(n_predict + 1, dtype=np.int32)
+        st = SpecStats()
+        if draft is None:
+            n = self.lib.ti_generate(self.h, iptr(p), len(p), n_predict, C.byref(params),
+                                     int(stop_at_eos), iptr(out), C.byref(st))
+        else:
+            n = self.lib.ti_spec_generate(self.h, draft.h, iptr(p), len(p), n_predict, k,
+                                          C.byref(params), int(stop_at_eos), iptr(out),
+                                          C.byref(st))
+        if n < 0:
+            raise RuntimeError(self.lib.ti_last_error().decode())
+        return out[:n].tolist(), st
 
     def tokenize(self, text, parse_special=True):
         b = text.encode("utf-8")

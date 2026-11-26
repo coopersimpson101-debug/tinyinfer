@@ -28,7 +28,8 @@ else
 endif
 CFLAGS += $(ARCH)
 
-LIB_SRC := src/platform.c src/quant.c src/kernels.c src/gguf.c src/tokenizer.c src/model.c src/sampler.c
+LIB_SRC := src/platform.c src/quant.c src/kernels.c src/gguf.c src/tokenizer.c src/model.c src/sampler.c \
+           src/kvcache.c src/speculative.c
 HDRS    := $(wildcard src/*.h) include/tinyinfer.h
 
 .PHONY: all metal test test-c test-py clean
